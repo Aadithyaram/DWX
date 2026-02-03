@@ -53,36 +53,37 @@ def _load_excel_data(excel_path: Path, metrics: Sequence[str]) -> pd.DataFrame:
 class AutoEncoder(nn.Module):
     def __init__(self, input_dim: int, latent_dim: int):
         super().__init__()
-        hidden_dims = _select_hidden_dims(input_dim, latent_dim)
-        encoder_layers: list[nn.Module] = []
-        in_features = input_dim
-        for hidden_dim in hidden_dims:
-            encoder_layers.extend(
-                [
-                    nn.Linear(in_features, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(p=0.1),
-                ]
-            )
-            in_features = hidden_dim
-        encoder_layers.append(nn.Linear(in_features, latent_dim))
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        decoder_layers: list[nn.Module] = []
-        in_features = latent_dim
-        for hidden_dim in reversed(hidden_dims):
-            decoder_layers.extend(
-                [
-                    nn.Linear(in_features, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(p=0.1),
-                ]
-            )
-            in_features = hidden_dim
-        decoder_layers.append(nn.Linear(in_features, input_dim))
-        self.decoder = nn.Sequential(*decoder_layers)
+        dropout = 0.1
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.LayerNorm(16),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(16, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(32, 16),
+            nn.LayerNorm(16),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(16, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.LayerNorm(16),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(16, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(32, 16),
+            nn.LayerNorm(16),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(16, input_dim),
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(inputs)
@@ -101,14 +102,21 @@ def _train_autoencoder(
     device: str,
     patience: int,
     min_delta: float,
+    weight_decay: float,
+    grad_clip: float,
 ) -> tuple[AutoEncoder, dict[str, float]]:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     input_dim = train_features.shape[1]
     model = AutoEncoder(input_dim=input_dim, latent_dim=latent_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
     loss_fn = nn.SmoothL1Loss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5
+    )
 
     train_dataset = TensorDataset(torch.from_numpy(train_features).float())
     val_dataset = TensorDataset(torch.from_numpy(val_features).float())
@@ -131,6 +139,7 @@ def _train_autoencoder(
             reconstruction = model(batch)
             loss = loss_fn(reconstruction, batch)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
         model.eval()
@@ -141,6 +150,7 @@ def _train_autoencoder(
                 reconstruction = model(batch)
                 val_losses.append(loss_fn(reconstruction, batch).item())
         val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        scheduler.step(val_loss)
 
         if best_val - val_loss > min_delta:
             best_val = val_loss
@@ -219,18 +229,6 @@ def _prepare_features(
         transformers,
         feature_names,
     )
-
-
-def _select_hidden_dims(input_dim: int, latent_dim: int) -> list[int]:
-    if input_dim <= 4:
-        return [max(latent_dim + 1, input_dim)]
-    if input_dim <= 16:
-        return [max(input_dim // 2, latent_dim + 2)]
-    first = max(input_dim // 2, latent_dim + 4)
-    second = max(input_dim // 4, latent_dim + 2)
-    if second >= first:
-        second = max(latent_dim + 1, first - 1)
-    return [first, second]
 
 
 def _validate_splits(validation_split: float, test_split: float) -> None:
@@ -366,6 +364,38 @@ def _compute_permutation_importance(
     )
 
 
+def _compute_group_permutation_importance(
+    model: AutoEncoder,
+    features: np.ndarray,
+    groups: dict[str, list[int]],
+    repeats: int,
+    seed: int,
+    device: str,
+) -> tuple[dict[str, float], dict[str, float]]:
+    model.eval()
+    loss_fn = nn.SmoothL1Loss()
+    rng = np.random.default_rng(seed)
+    base_loss = _reconstruction_loss(model, features, loss_fn, device)
+    group_names = list(groups.keys())
+    importances = np.zeros(len(group_names), dtype=np.float64)
+    importances_std = np.zeros(len(group_names), dtype=np.float64)
+    for idx, name in enumerate(group_names):
+        losses = []
+        group_indices = groups[name]
+        for _ in range(repeats):
+            shuffled = features.copy()
+            for column_idx in group_indices:
+                rng.shuffle(shuffled[:, column_idx])
+            loss = _reconstruction_loss(model, shuffled, loss_fn, device)
+            losses.append(loss - base_loss)
+        importances[idx] = float(np.mean(losses))
+        importances_std[idx] = float(np.std(losses))
+    return (
+        _normalize_importances(importances, group_names),
+        _normalize_importances(importances_std, group_names),
+    )
+
+
 def _reconstruction_loss(
     model: AutoEncoder, features: np.ndarray, loss_fn: nn.Module, device: str
 ) -> float:
@@ -378,6 +408,57 @@ def _reconstruction_loss(
             reconstruction = model(batch)
             losses.append(loss_fn(reconstruction, batch).item())
     return float(np.mean(losses)) if losses else float("inf")
+
+
+def _build_feature_groups(feature_names: Sequence[str]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = {}
+    zscaler_indices = [
+        idx for idx, name in enumerate(feature_names) if "zscaler" in name.lower()
+    ]
+    if zscaler_indices:
+        groups["zscaler"] = zscaler_indices
+    iops_indices = [
+        idx
+        for idx, name in enumerate(feature_names)
+        if name in {"readIOPS", "writeIOPS"}
+    ]
+    if iops_indices:
+        groups["iops"] = iops_indices
+    tcp_indices = [
+        idx
+        for idx, name in enumerate(feature_names)
+        if name in {"tcpDataReceivedMB", "tcpDataSentMB"}
+    ]
+    if tcp_indices:
+        groups["tcp"] = tcp_indices
+    return groups
+
+
+def _summarize_importances(
+    importances: list[dict[str, float]],
+    feature_names: Sequence[str],
+) -> tuple[dict[str, float], dict[str, float]]:
+    matrix = np.array(
+        [[importance.get(name, 0.0) for name in feature_names] for importance in importances]
+    )
+    mean_vals = matrix.mean(axis=0)
+    std_vals = matrix.std(axis=0)
+    return (
+        _normalize_importances(mean_vals, feature_names),
+        _normalize_importances(std_vals, feature_names),
+    )
+
+
+def _top_k_overlap(weightage_sets: list[dict[str, float]], k: int = 5) -> float:
+    if not weightage_sets:
+        return 0.0
+    top_sets = [
+        set(list(weights.keys())[:k]) for weights in weightage_sets if weights
+    ]
+    if not top_sets:
+        return 0.0
+    intersection = set.intersection(*top_sets)
+    return len(intersection) / k
 
 
 def run(
@@ -394,6 +475,8 @@ def run(
     test_split: float,
     patience: int,
     min_delta: float,
+    num_seeds: int,
+    permutation_repeats: int,
 ) -> dict[str, float]:
     data = _load_excel_data(excel_path, metrics)
     _validate_splits(validation_split, test_split)
@@ -406,38 +489,76 @@ def run(
     _, test_features, _, _, _ = _prepare_features(train_data, test_data)
     if train_features is None or val_features is None or test_features is None:
         raise ValueError("Failed to build training/validation/test feature sets.")
-    if latent_dim <= 0:
-        raise ValueError("latent_dim must be a positive integer.")
+    if latent_dim not in {2, 4, 8}:
+        raise ValueError("latent_dim must be one of 2, 4, or 8.")
     if latent_dim >= train_features.shape[1]:
         raise ValueError("latent_dim must be smaller than the number of features.")
     sample_count = train_features.shape[0]
     batch_size = min(batch_size, max(1, sample_count))
+    num_seeds = max(1, min(num_seeds, 5))
 
-    model, _ = _train_autoencoder(
-        train_features=train_features,
-        val_features=val_features,
-        test_features=test_features,
-        latent_dim=latent_dim,
-        epochs=epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        seed=seed,
-        device=device,
-        patience=patience,
-        min_delta=min_delta,
-    )
+    weightage_runs: list[dict[str, float]] = []
+    group_weightage_runs: list[dict[str, float]] = []
+    groups = _build_feature_groups(feature_names)
 
-    weightages, stds = _compute_permutation_importance(
-        model=model,
-        features=val_features,
-        feature_names=feature_names,
-        repeats=20,
-        seed=seed,
-        device=device,
+    for offset in range(num_seeds):
+        run_seed = seed + offset
+        model, _ = _train_autoencoder(
+            train_features=train_features,
+            val_features=val_features,
+            test_features=test_features,
+            latent_dim=latent_dim,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            seed=run_seed,
+            device=device,
+            patience=patience,
+            min_delta=min_delta,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+        )
+
+        weightages, _ = _compute_permutation_importance(
+            model=model,
+            features=val_features,
+            feature_names=feature_names,
+            repeats=permutation_repeats,
+            seed=run_seed,
+            device=device,
+        )
+        weightage_runs.append(weightages)
+        if groups:
+            group_weightages, _ = _compute_group_permutation_importance(
+                model=model,
+                features=val_features,
+                groups=groups,
+                repeats=permutation_repeats,
+                seed=run_seed,
+                device=device,
+            )
+            group_weightage_runs.append(group_weightages)
+
+    weightage_mean, weightage_std = _summarize_importances(
+        weightage_runs, feature_names
     )
-    output_payload = {"weightages": weightages, "importance_std": stds}
+    group_mean: dict[str, float] = {}
+    group_std: dict[str, float] = {}
+    if group_weightage_runs and groups:
+        group_names = list(groups.keys())
+        group_mean, group_std = _summarize_importances(
+            group_weightage_runs, group_names
+        )
+
+    output_payload = {
+        "weightages_mean": weightage_mean,
+        "weightages_std": weightage_std,
+        "group_weightages_mean": group_mean,
+        "group_weightages_std": group_std,
+        "top5_overlap": _top_k_overlap(weightage_runs, k=5),
+    }
     output_path.write_text(json.dumps(output_payload, indent=2), encoding="utf-8")
-    return weightages
+    return weightage_mean
 
 
 def main() -> None:
@@ -458,7 +579,7 @@ def main() -> None:
         default=Path("weightages.json"),
         help="Output JSON path for weightages.",
     )
-    parser.add_argument("--latent-dim", type=int, default=2)
+    parser.add_argument("--latent-dim", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -488,6 +609,18 @@ def main() -> None:
         help="Minimum validation loss improvement to reset patience.",
     )
     parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=3,
+        help="Number of training runs with different seeds (max 5).",
+    )
+    parser.add_argument(
+        "--permutation-repeats",
+        type=int,
+        default=20,
+        help="Number of shuffles per feature/group for permutation importance.",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         choices=["cpu", "cuda"],
@@ -510,6 +643,8 @@ def main() -> None:
         test_split=args.test_split,
         patience=args.patience,
         min_delta=args.min_delta,
+        num_seeds=args.num_seeds,
+        permutation_repeats=args.permutation_repeats,
     )
 
 

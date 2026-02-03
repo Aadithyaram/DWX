@@ -4,7 +4,7 @@ import importlib.util
 
 HAS_DEPS = all(
     importlib.util.find_spec(module_name) is not None
-    for module_name in ("numpy", "torch", "pandas", "sklearn")
+    for module_name in ("numpy",)
 )
 
 if HAS_DEPS:
