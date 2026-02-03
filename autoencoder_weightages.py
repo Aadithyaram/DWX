@@ -11,7 +11,7 @@ from typing import Iterable, List, Sequence
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PowerTransformer, RobustScaler, StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
@@ -144,20 +144,32 @@ def _feature_weightages(model: AutoEncoder, feature_names: Iterable[str]) -> dic
         normalized = np.zeros_like(importance)
     else:
         normalized = importance / total
-    return {
-        feature: float(weight)
+    paired = [
+        (feature, float(weight))
         for feature, weight in zip(feature_names, normalized, strict=False)
-    }
+    ]
+    paired.sort(key=lambda item: item[1], reverse=True)
+    return dict(paired)
 
 
-def _prepare_features(data: pd.DataFrame) -> tuple[np.ndarray, StandardScaler]:
+def _prepare_features(
+    data: pd.DataFrame,
+) -> tuple[np.ndarray, StandardScaler | RobustScaler, PowerTransformer | None]:
     numeric_data = data.apply(pd.to_numeric, errors="coerce")
     numeric_data = numeric_data.dropna()
     if numeric_data.empty:
         raise ValueError("No numeric rows available after cleaning the data.")
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(numeric_data.values)
-    return scaled.astype(np.float32), scaler
+    skewness = numeric_data.skew().abs().max()
+    power_transformer = None
+    values = numeric_data.values
+    if skewness > 1.0:
+        power_transformer = PowerTransformer(method="yeo-johnson", standardize=False)
+        values = power_transformer.fit_transform(values)
+        scaler: StandardScaler | RobustScaler = RobustScaler()
+    else:
+        scaler = StandardScaler()
+    scaled = scaler.fit_transform(values)
+    return scaled.astype(np.float32), scaler, power_transformer
 
 
 def run(
@@ -175,13 +187,21 @@ def run(
     min_delta: float,
 ) -> dict[str, float]:
     data = _load_excel_data(excel_path, metrics)
-    features, _ = _prepare_features(data)
+    features, _, _ = _prepare_features(data)
     if latent_dim <= 0:
         raise ValueError("latent_dim must be a positive integer.")
     if latent_dim >= features.shape[1]:
         latent_dim = max(1, features.shape[1] // 2)
+    if latent_dim == 2 and features.shape[1] > 4:
+        latent_dim = min(8, max(2, features.shape[1] // 2))
     if not 0.0 < validation_split < 1.0:
         raise ValueError("validation_split must be between 0 and 1 (exclusive).")
+    sample_count = features.shape[0]
+    if sample_count < 200:
+        epochs = max(50, min(epochs, 300))
+    elif sample_count > 5000:
+        epochs = min(epochs, 150)
+    batch_size = min(batch_size, max(1, min(128, sample_count)))
 
     model, _ = _train_autoencoder(
         features=features,
