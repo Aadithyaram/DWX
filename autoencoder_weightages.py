@@ -53,11 +53,36 @@ def _load_excel_data(excel_path: Path, metrics: Sequence[str]) -> pd.DataFrame:
 class AutoEncoder(nn.Module):
     def __init__(self, input_dim: int, latent_dim: int):
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, latent_dim),
-            nn.ReLU(),
-        )
-        self.decoder = nn.Linear(latent_dim, input_dim)
+        hidden_dims = _select_hidden_dims(input_dim, latent_dim)
+        encoder_layers: list[nn.Module] = []
+        in_features = input_dim
+        for hidden_dim in hidden_dims:
+            encoder_layers.extend(
+                [
+                    nn.Linear(in_features, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(p=0.1),
+                ]
+            )
+            in_features = hidden_dim
+        encoder_layers.append(nn.Linear(in_features, latent_dim))
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        decoder_layers: list[nn.Module] = []
+        in_features = latent_dim
+        for hidden_dim in reversed(hidden_dims):
+            decoder_layers.extend(
+                [
+                    nn.Linear(in_features, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(p=0.1),
+                ]
+            )
+            in_features = hidden_dim
+        decoder_layers.append(nn.Linear(in_features, input_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(inputs)
@@ -73,6 +98,7 @@ def _train_autoencoder(
     seed: int,
     device: str,
     validation_split: float,
+    test_split: float,
     patience: int,
     min_delta: float,
 ) -> tuple[AutoEncoder, dict[str, float]]:
@@ -86,16 +112,18 @@ def _train_autoencoder(
 
     dataset = TensorDataset(torch.from_numpy(features).float())
     val_size = max(1, int(len(dataset) * validation_split))
-    train_size = max(1, len(dataset) - val_size)
-    if train_size + val_size > len(dataset):
-        val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(
+    test_size = max(1, int(len(dataset) * test_split))
+    train_size = max(1, len(dataset) - val_size - test_size)
+    if train_size + val_size + test_size > len(dataset):
+        test_size = max(1, len(dataset) - train_size - val_size)
+    train_dataset, val_dataset, test_dataset = random_split(
         dataset,
-        [train_size, val_size],
+        [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(seed),
     )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     best_state = None
     best_val = float("inf")
@@ -132,7 +160,16 @@ def _train_autoencoder(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    return model, {"validation_loss": best_val}
+    model.eval()
+    test_losses = []
+    with torch.no_grad():
+        for (batch,) in test_loader:
+            batch = batch.to(device)
+            reconstruction = model(batch)
+            test_losses.append(loss_fn(reconstruction, batch).item())
+    test_loss = float(np.mean(test_losses)) if test_losses else float("inf")
+
+    return model, {"validation_loss": best_val, "test_loss": test_loss}
 
 
 def _feature_weightages(model: AutoEncoder, feature_names: Iterable[str]) -> dict[str, float]:
@@ -172,6 +209,27 @@ def _prepare_features(
     return scaled.astype(np.float32), scaler, power_transformer
 
 
+def _select_hidden_dims(input_dim: int, latent_dim: int) -> list[int]:
+    if input_dim <= 4:
+        return [max(latent_dim + 1, input_dim)]
+    if input_dim <= 16:
+        return [max(input_dim // 2, latent_dim + 2)]
+    first = max(input_dim // 2, latent_dim + 4)
+    second = max(input_dim // 4, latent_dim + 2)
+    if second >= first:
+        second = max(latent_dim + 1, first - 1)
+    return [first, second]
+
+
+def _validate_splits(validation_split: float, test_split: float) -> None:
+    if not 0.0 < validation_split < 1.0:
+        raise ValueError("validation_split must be between 0 and 1 (exclusive).")
+    if not 0.0 < test_split < 1.0:
+        raise ValueError("test_split must be between 0 and 1 (exclusive).")
+    if validation_split + test_split >= 1.0:
+        raise ValueError("validation_split + test_split must be less than 1.")
+
+
 def run(
     excel_path: Path,
     metrics: Sequence[str],
@@ -183,6 +241,7 @@ def run(
     seed: int,
     device: str,
     validation_split: float,
+    test_split: float,
     patience: int,
     min_delta: float,
 ) -> dict[str, float]:
@@ -194,8 +253,7 @@ def run(
         latent_dim = max(1, features.shape[1] // 2)
     if latent_dim == 2 and features.shape[1] > 4:
         latent_dim = min(8, max(2, features.shape[1] // 2))
-    if not 0.0 < validation_split < 1.0:
-        raise ValueError("validation_split must be between 0 and 1 (exclusive).")
+    _validate_splits(validation_split, test_split)
     sample_count = features.shape[0]
     if sample_count < 200:
         epochs = max(50, min(epochs, 300))
@@ -212,6 +270,7 @@ def run(
         seed=seed,
         device=device,
         validation_split=validation_split,
+        test_split=test_split,
         patience=patience,
         min_delta=min_delta,
     )
@@ -251,6 +310,12 @@ def main() -> None:
         help="Fraction of data reserved for validation.",
     )
     parser.add_argument(
+        "--test-split",
+        type=float,
+        default=0.1,
+        help="Fraction of data reserved for testing.",
+    )
+    parser.add_argument(
         "--patience",
         type=int,
         default=20,
@@ -282,6 +347,7 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         validation_split=args.validation_split,
+        test_split=args.test_split,
         patience=args.patience,
         min_delta=args.min_delta,
     )
